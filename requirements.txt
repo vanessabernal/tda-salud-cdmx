@@ -1,0 +1,10 @@
+pandas
+numpy
+matplotlib
+scikit-learn
+folium
+ripser
+persim
+gudhi
+jupyter
+ipykernel
