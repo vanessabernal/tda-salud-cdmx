@@ -25,10 +25,18 @@ OUTPUT_HTML = PROJECT_ROOT / "mapa_rezago_y_salud_cdmx.html"
 
 PUB_CSV = PROCESSED_DIR / "salud_cdmx_publico.csv"
 PRIV_CSV = PROCESSED_DIR / "salud_cdmx_privado.csv"
+DENUE_ZIP = RAW_DIR / "denue_09_csv.zip"
+DENUE_SALUD_CSV = PROCESSED_DIR / "salud_cdmx_denue_limpio.csv"
 
 DOWNLOAD_URL = (
     "https://www.datos.gob.mx/dataset/rezago_social/resource/"
     "afdb17f9-1f86-4511-9446-a46f688acbf2"
+)
+DENUE_DOWNLOAD_URL = (
+    "https://cfcetlsadls.blob.core.windows.net/raw/inegi/denue_por_estado/"
+    "ciudad_de_mexico_zip/denue_09_csv.zip?sv=2025-07-05&spr=https&"
+    "st=2026-04-24T19%3A24%3A46Z&se=2026-06-09T19%3A24%3A00Z&sr=b&sp=r&"
+    "sig=%2F5%2BqqFCki1Y%2Bdl3Y21slq3HOd7Ek5cDjh849JlR37Dc%3D"
 )
 
 # =========================================================================
@@ -114,6 +122,135 @@ def clean_code(series, width):
     return series.astype(str).str.strip().str.replace(r"\.0$", "", regex=True).str.zfill(width)
 
 
+def preprocess_denue_salud():
+    """Create the cleaned DENUE health CSV used by the public/private split."""
+    if DENUE_SALUD_CSV.exists():
+        return
+
+    if not DENUE_ZIP.exists():
+        raise FileNotFoundError(
+            f"No se encontro {DENUE_ZIP}\n\n"
+            "Descargalo desde la raiz del repo con:\n"
+            f'curl.exe -L "{DENUE_DOWNLOAD_URL}" -o data/raw/denue_09_csv.zip'
+        )
+
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(DENUE_ZIP) as z:
+        with z.open("conjunto_de_datos/denue_inegi_09_.csv") as csv_file:
+            df_raw = pd.read_csv(csv_file, encoding="latin1", low_memory=False)
+
+    df = df_raw[df_raw["codigo_act"].astype(str).str.startswith("62")].copy()
+    df["latitud"] = pd.to_numeric(df["latitud"], errors="coerce")
+    df["longitud"] = pd.to_numeric(df["longitud"], errors="coerce")
+    df = df.dropna(subset=["latitud", "longitud"])
+
+    cols = [
+        "id", "nom_estab", "codigo_act", "nombre_act", "per_ocu",
+        "municipio", "localidad", "latitud", "longitud", "fecha_alta",
+    ]
+    df[cols].to_csv(DENUE_SALUD_CSV, index=False)
+    print(f"CSV DENUE salud creado: {DENUE_SALUD_CSV} ({len(df):,} filas)")
+
+
+def build_public_private_csvs():
+    """Generate public/private location CSVs from the cleaned DENUE health file."""
+    if PUB_CSV.exists() and PRIV_CSV.exists():
+        return
+
+    preprocess_denue_salud()
+
+    df = pd.read_csv(DENUE_SALUD_CSV)
+    df["codigo_4d"] = df["codigo_act"].astype(str).str[:4]
+
+    prefijos_validos = ["6211", "6212", "6213", "6214", "6215", "6221", "6222", "6223"]
+    mapa_tipo = {
+        "6211": "Consultorio medico",
+        "6212": "Consultorio dental",
+        "6213": "Consultorio otros profesionales",
+        "6214": "Centro ambulatorio",
+        "6215": "Laboratorio/Dx",
+        "6221": "Hospital general",
+        "6222": "Hospital psiquiatrico",
+        "6223": "Hospital especializado",
+    }
+
+    df = df[df["codigo_4d"].isin(prefijos_validos)].copy()
+    df["tipo_infra"] = df["codigo_4d"].map(mapa_tipo)
+
+    nombre_lower = df["nombre_act"].astype(str).str.lower()
+    es_publico = nombre_lower.str.contains("sector público|sector publico", regex=True)
+    es_privado = nombre_lower.str.contains("sector privado")
+    df["sector"] = np.select(
+        [es_publico, es_privado],
+        ["publico", "privado"],
+        default="otro",
+    )
+    df = df[df["sector"].isin(["publico", "privado"])].copy()
+
+    points = gpd.GeoDataFrame(
+        df,
+        geometry=gpd.points_from_xy(df["longitud"], df["latitud"]),
+        crs="EPSG:4326",
+    ).to_crs("EPSG:32614")
+    df["x_m"] = points.geometry.x.values
+    df["y_m"] = points.geometry.y.values
+
+    def tipos_unicos(values):
+        return "; ".join(sorted(values.dropna().unique()))
+
+    def tipo_mas_frecuente(values):
+        counts = values.value_counts()
+        return counts.index[0] if len(counts) else None
+
+    def colapsar_por_ubicacion(df_in):
+        return (
+            df_in.groupby(["x_m", "y_m"], as_index=False)
+            .agg(
+                n_servicios=("id", "size"),
+                id=("id", "first"),
+                nom_estab=("nom_estab", "first"),
+                codigo_act=("codigo_act", "first"),
+                nombre_act=("nombre_act", "first"),
+                tipo_infra=("tipo_infra", tipo_mas_frecuente),
+                tipos_presentes=("tipo_infra", tipos_unicos),
+                sector=("sector", "first"),
+                per_ocu=("per_ocu", "first"),
+                municipio=("municipio", "first"),
+                localidad=("localidad", "first"),
+                latitud=("latitud", "first"),
+                longitud=("longitud", "first"),
+                fecha_alta=("fecha_alta", "first"),
+            )
+        )
+
+    df_pub = colapsar_por_ubicacion(df[df["sector"] == "publico"])
+    df_priv = colapsar_por_ubicacion(df[df["sector"] == "privado"])
+
+    lat_min, lat_max = 19.05, 19.60
+    lon_min, lon_max = -99.40, -98.94
+
+    def filtrar_bb(df_in):
+        return df_in[
+            df_in["latitud"].between(lat_min, lat_max)
+            & df_in["longitud"].between(lon_min, lon_max)
+        ].copy()
+
+    df_pub = filtrar_bb(df_pub)
+    df_priv = filtrar_bb(df_priv)
+
+    cols_finales = [
+        "id", "nom_estab", "codigo_act", "nombre_act",
+        "tipo_infra", "tipos_presentes", "n_servicios",
+        "sector", "per_ocu", "municipio", "localidad",
+        "latitud", "longitud", "x_m", "y_m", "fecha_alta",
+    ]
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    df_pub[cols_finales].to_csv(PUB_CSV, index=False)
+    df_priv[cols_finales].to_csv(PRIV_CSV, index=False)
+    print(f"CSV publico creado: {PUB_CSV} ({len(df_pub):,} ubicaciones)")
+    print(f"CSV privado creado: {PRIV_CSV} ({len(df_priv):,} ubicaciones)")
+
+
 # =========================================================================
 # 1) Cargar y filtrar la capa de rezago social
 # =========================================================================
@@ -168,12 +305,7 @@ print(f"AGEB de CDMX cargadas: {len(cdmx):,}")
 # 2) Cargar las nubes de puntos de DENUE (salida del notebook 02)
 # =========================================================================
 
-for csv_path in [PUB_CSV, PRIV_CSV]:
-    if not csv_path.exists():
-        raise FileNotFoundError(
-            f"No se encontro {csv_path}\n"
-            "Corre primero el notebook 02_filtrado_y_split.ipynb."
-        )
+build_public_private_csvs()
 
 df_pub = pd.read_csv(PUB_CSV)
 df_priv = pd.read_csv(PRIV_CSV)

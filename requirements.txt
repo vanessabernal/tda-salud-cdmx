@@ -3,6 +3,7 @@ numpy
 matplotlib
 scikit-learn
 folium
+geopandas
 ripser
 persim
 gudhi
