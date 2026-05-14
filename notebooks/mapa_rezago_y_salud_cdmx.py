@@ -13,7 +13,6 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 import folium
-from folium.plugins import HeatMap
 from pathlib import Path
 import urllib.request
 import zipfile
@@ -116,6 +115,27 @@ def color_for_grs(value):
         "muy alto": "#d73027",
     }
     return colors.get(str(value).strip().lower(), "#bdbdbd")
+
+
+def score_for_grs(value):
+    scores = {
+        "muy bajo": 1,
+        "bajo": 2,
+        "medio": 3,
+        "alto": 4,
+        "muy alto": 5,
+    }
+    return scores.get(str(value).strip().lower(), np.nan)
+
+
+def color_for_prioridad(value):
+    colors = {
+        "Baja": "#1a9850",
+        "Media": "#fee08b",
+        "Alta": "#fc8d59",
+        "Muy alta": "#d73027",
+    }
+    return colors.get(str(value).strip(), "#bdbdbd")
 
 
 def clean_code(series, width):
@@ -298,6 +318,7 @@ if cdmx.empty:
 
 if cdmx.crs and cdmx.crs.to_epsg() != 4326:
     cdmx = cdmx.to_crs(epsg=4326)
+cdmx = cdmx.reset_index(drop=True)
 
 print(f"AGEB de CDMX cargadas: {len(cdmx):,}")
 
@@ -314,10 +335,72 @@ print(f"Ubicaciones publicas: {len(df_pub):,}")
 print(f"Ubicaciones privadas: {len(df_priv):,}")
 
 # =========================================================================
-# 3) Construir el mapa interactivo
+# 3) Calcular prioridad de rezago en salud por AGEB
 # =========================================================================
 
-# prefer_canvas=True acelera muchisimo el render con miles de CircleMarker
+df_pub["sector"] = "publico"
+df_priv["sector"] = "privado"
+df_salud = pd.concat([df_pub, df_priv], ignore_index=True)
+
+salud_points = gpd.GeoDataFrame(
+    df_salud,
+    geometry=gpd.points_from_xy(df_salud["longitud"], df_salud["latitud"]),
+    crs="EPSG:4326",
+)
+
+join = gpd.sjoin(
+    salud_points[["sector", "n_servicios", "geometry"]],
+    cdmx[[cvegeo_column, "geometry"]],
+    how="left",
+    predicate="within",
+)
+
+join_valid = join.dropna(subset=["index_right"]).copy()
+join_valid["index_right"] = join_valid["index_right"].astype(int)
+
+conteo = join_valid.groupby("index_right").agg(
+    servicios_salud=("n_servicios", "sum"),
+    ubicaciones_salud=("n_servicios", "size"),
+)
+conteo_sector = join_valid.pivot_table(
+    index="index_right",
+    columns="sector",
+    values="n_servicios",
+    aggfunc="sum",
+    fill_value=0,
+)
+conteo["servicios_publicos"] = conteo_sector.get("publico", 0)
+conteo["servicios_privados"] = conteo_sector.get("privado", 0)
+
+for column in ["servicios_salud", "ubicaciones_salud", "servicios_publicos", "servicios_privados"]:
+    cdmx[column] = conteo[column].reindex(cdmx.index).fillna(0).astype(int)
+
+cdmx_metric = cdmx.to_crs("EPSG:32614")
+cdmx["area_km2"] = cdmx_metric.geometry.area / 1_000_000
+cdmx["servicios_por_km2"] = cdmx["servicios_salud"] / cdmx["area_km2"].replace(0, np.nan)
+cdmx["grs_score"] = cdmx[grs_column].map(score_for_grs)
+
+max_density = cdmx["servicios_por_km2"].quantile(0.95)
+if pd.isna(max_density) or max_density == 0:
+    max_density = 1
+
+cdmx["oferta_norm"] = (cdmx["servicios_por_km2"] / max_density).clip(0, 1).fillna(0)
+cdmx["prioridad_score"] = cdmx["grs_score"] * (1 - 0.65 * cdmx["oferta_norm"])
+
+cdmx["prioridad_salud"] = pd.cut(
+    cdmx["prioridad_score"],
+    bins=[0, 1.8, 2.8, 3.8, 5.1],
+    labels=["Baja", "Media", "Alta", "Muy alta"],
+    include_lowest=True,
+).astype(str)
+
+print("Prioridad de rezago en salud por AGEB:")
+print(cdmx["prioridad_salud"].value_counts().sort_index())
+
+# =========================================================================
+# 4) Construir el mapa interactivo
+# =========================================================================
+
 m = folium.Map(
     location=[19.4326, -99.1332],
     zoom_start=11,
@@ -325,19 +408,35 @@ m = folium.Map(
     prefer_canvas=True,
 )
 
-# --- Capa 1: Choropleth de rezago social ---
-rezago_layer = folium.FeatureGroup(name="Grado de rezago social (AGEB)", show=True)
+# --- Capa principal: prioridad de rezago en salud ---
+rezago_layer = folium.FeatureGroup(name="Prioridad de rezago en salud (AGEB)", show=True)
 folium.GeoJson(
     cdmx,
     style_function=lambda feature: {
-        "fillColor": color_for_grs(feature["properties"].get(grs_column)),
+        "fillColor": color_for_prioridad(feature["properties"].get("prioridad_salud")),
         "color": "#4a4a4a",
         "weight": 0.3,
         "fillOpacity": 0.65,
     },
     tooltip=folium.GeoJsonTooltip(
-        fields=[cvegeo_column, grs_column],
-        aliases=["CVEGEO", "Grado de rezago social"],
+        fields=[
+            cvegeo_column,
+            grs_column,
+            "prioridad_salud",
+            "servicios_salud",
+            "servicios_publicos",
+            "servicios_privados",
+            "servicios_por_km2",
+        ],
+        aliases=[
+            "CVEGEO",
+            "Grado de rezago social",
+            "Prioridad en salud",
+            "Servicios de salud",
+            "Servicios publicos",
+            "Servicios privados",
+            "Servicios por km2",
+        ],
         localize=True,
     ),
 ).add_to(rezago_layer)
@@ -350,7 +449,6 @@ def radio_marcador(n_servicios, base, escala):
 
 
 # --- Capa 2: Establecimientos PRIVADOS ---
-# Color azul, marcadores chicos y semitransparentes (son ~13k puntos)
 priv_layer = folium.FeatureGroup(
     name=f"Privado ({len(df_priv):,} ubicaciones)",
     show=True,
@@ -373,7 +471,6 @@ for _, row in df_priv.iterrows():
 priv_layer.add_to(m)
 
 # --- Capa 3: Establecimientos PUBLICOS ---
-# Color morado oscuro con borde blanco para destacar sobre cualquier color del choropleth
 pub_layer = folium.FeatureGroup(
     name=f"Publico ({len(df_pub):,} ubicaciones)",
     show=True,
@@ -395,20 +492,8 @@ for _, row in df_pub.iterrows():
     ).add_to(pub_layer)
 pub_layer.add_to(m)
 
-# --- Capa 4 (oculta por defecto): Mapa de calor de la oferta privada ---
-heat_data = df_priv[["latitud", "longitud", "n_servicios"]].values.tolist()
-heat_layer = folium.FeatureGroup(name="Densidad oferta privada (heatmap)", show=False)
-HeatMap(
-    heat_data,
-    radius=12,
-    blur=18,
-    min_opacity=0.2,
-    max_zoom=13,
-).add_to(heat_layer)
-heat_layer.add_to(m)
-
 # =========================================================================
-# 4) Leyenda fija y control de capas
+# 5) Leyenda fija y control de capas
 # =========================================================================
 
 legend_html = """
@@ -425,17 +510,21 @@ legend_html = """
     box-shadow: 0 2px 6px rgba(0,0,0,0.15);
     line-height: 1.6;
 ">
-<b style="font-size:13px;">Grado de rezago social</b><br>
-<i style="background:#1a9850;width:14px;height:14px;display:inline-block;margin-right:6px;"></i>Muy bajo<br>
-<i style="background:#91cf60;width:14px;height:14px;display:inline-block;margin-right:6px;"></i>Bajo<br>
-<i style="background:#fee08b;width:14px;height:14px;display:inline-block;margin-right:6px;"></i>Medio<br>
-<i style="background:#fc8d59;width:14px;height:14px;display:inline-block;margin-right:6px;"></i>Alto<br>
-<i style="background:#d73027;width:14px;height:14px;display:inline-block;margin-right:6px;"></i>Muy alto<br>
+<b style="font-size:13px;">Prioridad de rezago en salud</b><br>
+<i style="background:#1a9850;width:14px;height:14px;display:inline-block;margin-right:6px;"></i>Baja<br>
+<i style="background:#fee08b;width:14px;height:14px;display:inline-block;margin-right:6px;"></i>Media<br>
+<i style="background:#fc8d59;width:14px;height:14px;display:inline-block;margin-right:6px;"></i>Alta<br>
+<i style="background:#d73027;width:14px;height:14px;display:inline-block;margin-right:6px;"></i>Muy alta<br>
 <hr style="margin:6px 0;">
 <b style="font-size:13px;">Establecimientos de salud</b><br>
 <i style="background:#4a148c;border:1px solid #fff;border-radius:50%;width:12px;height:12px;display:inline-block;margin-right:6px;"></i>Publico<br>
 <i style="background:#1f77b4;border-radius:50%;width:10px;height:10px;display:inline-block;margin-right:6px;opacity:0.7;"></i>Privado<br>
-<span style="font-size:10px;color:#666;">(Tamano proporcional a # de servicios en la ubicacion)</span>
+<span style="font-size:10px;color:#666;">Tamano proporcional a # de servicios.</span>
+<hr style="margin:6px 0;">
+<span style="font-size:10px;color:#666;">
+Combina GRS general con baja densidad<br>
+de establecimientos de salud DENUE.
+</span>
 </div>
 """
 m.get_root().html.add_child(folium.Element(legend_html))
@@ -443,9 +532,9 @@ m.get_root().html.add_child(folium.Element(legend_html))
 folium.LayerControl(collapsed=False).add_to(m)
 
 # =========================================================================
-# 5) Guardar
+# 6) Guardar
 # =========================================================================
 
 m.save(OUTPUT_HTML)
 print(f"\nMapa guardado en: {OUTPUT_HTML}")
-print("Abrelo en el navegador para explorar las tres capas.")
+print("Abrelo en el navegador para explorar la prioridad por AGEB y las capas publico/privado.")
